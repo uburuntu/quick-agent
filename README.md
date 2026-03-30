@@ -3,8 +3,10 @@
 Right-click any folder in macOS Finder to instantly open it in your favorite AI coding agent.
 
 <p align="center">
-  <img src="assets/demo.png" alt="Quick Agent demo" width="600">
+  <img src="assets/demo.gif" alt="Quick Agent demo" width="720">
 </p>
+
+> **Demo not loading?** Run `vhs demo.tape` locally to generate it, or see the [install output](#install) below.
 
 ## Supported Agents
 
@@ -40,6 +42,8 @@ The installer auto-detects your AI agents and terminal, picks smart defaults, an
 ```
   ⚡ Quick Agent v1.0.0
 
+    ✓ Installed CLI to ~/.local/bin/quick-agent
+
   Scanning for AI coding agents...
     ✓ claude   — Claude Code
     ✓ codex    — Codex
@@ -68,7 +72,7 @@ Quick Agent installs three [macOS Quick Actions](https://support.apple.com/guide
 | Quick Action | What it does |
 |---|---|
 | **Open in Claude Code** | Instantly launches your default agent in the selected folder |
-| **Open in Agent...** | Shows a picker dialog to choose any installed agent |
+| **Open in Agent...** | Shows a native macOS picker dialog to choose any installed agent |
 | **Quick Agent Settings** | Opens the configuration menu |
 
 When you right-click a **file**, Quick Agent opens its parent folder. When you right-click a **folder**, it opens that folder directly.
@@ -83,6 +87,18 @@ When you right-click a **file**, Quick Agent opens its parent folder. When you r
 
 ```bash
 quick-agent config
+```
+
+```
+  ⚡ Quick Agent — Settings
+
+  Default agent:  Claude Code
+  Terminal:       iTerm2
+
+  [1] Change default agent
+  [2] Change terminal
+  [3] Reinstall Quick Actions
+  [q] Quit
 ```
 
 ### Manual config
@@ -124,8 +140,8 @@ rm $(which quick-agent)
 
 ### Quick Actions don't appear in right-click menu
 
-1. Open **System Settings → Privacy & Security → Extensions → Finder Extensions**
-2. Make sure the Quick Actions are enabled
+1. Right-click any folder → **Quick Actions → Customize...** → enable the Quick Agent actions
+2. Or: **System Settings → Privacy & Security → Extensions → Finder Extensions**
 3. Try restarting Finder: `killall Finder`
 4. Or flush the services cache: `/System/Library/CoreServices/pbs -flush`
 
@@ -138,13 +154,28 @@ Grant in **System Settings → Privacy & Security → Automation**.
 ### Agent CLI not found
 
 Quick Agent checks these directories for CLI tools:
-- `/usr/local/bin`
-- `/opt/homebrew/bin`
-- `~/.local/bin`
-- `~/.cargo/bin`
+- `/usr/local/bin`, `/opt/homebrew/bin`
+- `~/.local/bin`, `~/.cargo/bin`
 - nvm and pyenv paths
 
 If your agent is installed elsewhere, make sure it's in your `PATH`.
+
+## Recording the Demo
+
+The demo GIF is generated from `demo.tape` using [VHS](https://github.com/charmbracelet/vhs):
+
+```bash
+brew install vhs
+vhs demo.tape
+```
+
+A [GitHub Action](.github/workflows/demo.yml) auto-regenerates it when the tape file or script changes.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, adding new agents/terminals, and the release process.
+
+The Homebrew formula auto-updates via [GitHub Action](.github/workflows/homebrew-bump.yml) on each release.
 
 ## Requirements
 

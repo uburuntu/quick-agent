@@ -32,6 +32,7 @@ _yellow() { printf '\033[33m%s\033[0m' "$*"; }
 
 _ok()   { printf "    $(_green '✓') %s\n" "$*"; }
 _fail() { printf "    $(_red '✗') %s\n" "$*"; }
+_info() { printf "    $(_dim '·') %s\n" "$*"; }
 
 # ── Agent Registry ───────────────────────────────────────────────
 
@@ -49,7 +50,6 @@ agent_name() {
 }
 
 agent_cmd() {
-    # The CLI command to run for each agent
     echo "$1"
 }
 
@@ -175,10 +175,36 @@ auto_select_agent() {
     done
 }
 
+# ── Binary Self-Install ─────────────────────────────────────────
+# Ensure quick-agent is in a PATH location so workflows can find it.
+
+_ensure_binary_in_path() {
+    # Already accessible?
+    for p in /usr/local/bin /opt/homebrew/bin "$HOME/.local/bin"; do
+        [ -x "$p/quick-agent" ] && return 0
+    done
+
+    # Resolve path to the currently running script
+    local self
+    self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+    # Pick a writable PATH location
+    local target=""
+    if [ -w "/usr/local/bin" ]; then
+        target="/usr/local/bin/quick-agent"
+    else
+        mkdir -p "$HOME/.local/bin" 2>/dev/null || true
+        target="$HOME/.local/bin/quick-agent"
+    fi
+
+    cp "$self" "$target" && chmod +x "$target"
+    _ok "Installed CLI to ${target}"
+    return 0
+}
+
 # ── AppleScript Helpers ──────────────────────────────────────────
 
 _as_escape() {
-    # Escape a string for safe embedding in AppleScript double-quoted strings
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
@@ -278,6 +304,8 @@ _generate_info_plist() {
 	<key>NSServices</key>
 	<array>
 		<dict>
+			<key>NSBackgroundColorName</key>
+			<string>background</string>
 			<key>NSIconName</key>
 			<string>${icon_name}</string>
 			<key>NSMenuItem</key>
@@ -543,8 +571,8 @@ _create_workflow() {
 
 _wf_script() {
     local mode="$1"
-    # This heredoc is single-quoted to prevent expansion of $HOME, $PATH, $1
-    # These variables are expanded at RUNTIME by Automator's bash
+    # Single-quoted heredoc prevents $HOME/$PATH/$1 expansion at generation time.
+    # These get expanded at RUNTIME when Automator's bash runs the script.
     cat <<'__HEADER__'
 export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 if [ -d "$HOME/.nvm/versions/node" ]; then
@@ -574,8 +602,10 @@ _install_workflows() {
     _create_workflow "Quick Agent Settings" "$(_wf_script setup)" "gear"
     _ok "Quick Agent Settings"
 
-    # Refresh the services database
+    # Refresh services database and restart Finder to pick up new actions
     /System/Library/CoreServices/pbs -flush 2>/dev/null || true
+    killall pbs 2>/dev/null || true
+    killall Finder 2>/dev/null || true
 }
 
 _remove_workflows() {
@@ -597,6 +627,9 @@ cmd_install() {
     echo ""
     printf "  $(_bold '⚡ Quick Agent') v${VERSION}\n"
     echo ""
+
+    # ── Ensure binary is in PATH ──
+    _ensure_binary_in_path
 
     # ── Scan agents ──
     printf "  Scanning for AI coding agents...\n"
@@ -711,8 +744,11 @@ cmd_install() {
     echo ""
     printf "  ✨ $(_bold 'Done!') Right-click any folder in Finder to try it.\n"
     echo ""
-    printf "  $(_dim 'Tip: If Quick Actions don'\''t appear, go to System Settings →')\n"
-    printf "  $(_dim '     Privacy & Security → Extensions → Finder Extensions')\n"
+    printf "  $(_dim 'Quick Actions appear under: right-click → Quick Actions')\n"
+    printf "  $(_dim 'If they don'\''t show up:')\n"
+    printf "  $(_dim '  1. Right-click a folder → Quick Actions → Customize...')\n"
+    printf "  $(_dim '  2. Or: System Settings → Privacy & Security → Extensions → Finder')\n"
+    printf "  $(_dim '  3. Enable the Quick Agent actions')\n"
     echo ""
 }
 

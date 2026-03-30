@@ -1,0 +1,67 @@
+name: Bump Homebrew Formula
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  bump-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release info
+        id: release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARBALL_URL="https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          SHA256=$(curl -fsSL "$TARBALL_URL" | sha256sum | cut -d' ' -f1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tarball_url=$TARBALL_URL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: uburuntu/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update formula
+        run: |
+          cat > Formula/quick-agent.rb <<'RUBY'
+          class QuickAgent < Formula
+            desc "Right-click any folder in macOS Finder to open AI coding agents"
+            homepage "https://github.com/uburuntu/quick-agent"
+          RUBY
+
+          # Append dynamic values (can't use heredoc variables inside single-quoted block)
+          cat >> Formula/quick-agent.rb <<RUBY
+            url "${{ steps.release.outputs.tarball_url }}"
+            sha256 "${{ steps.release.outputs.sha256 }}"
+            license "MIT"
+
+            def install
+              bin.install "quick-agent"
+            end
+
+            def caveats
+              <<~EOS
+                Run \`quick-agent install\` to set up Finder Quick Actions.
+
+                After installation, right-click any folder in Finder to
+                open it in Claude Code, Codex, Gemini, Aider, or Cursor.
+              EOS
+            end
+
+            test do
+              assert_match "quick-agent v#{version}", shell_output("#{bin}/quick-agent --version")
+            end
+          end
+          RUBY
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/quick-agent.rb
+          git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "quick-agent ${{ steps.release.outputs.version }}"
+          git push
