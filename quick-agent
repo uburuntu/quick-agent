@@ -1,0 +1,1044 @@
+#!/bin/bash
+#
+# quick-agent — Right-click any folder in Finder to open AI coding agents
+# https://github.com/uburuntu/quick-agent
+#
+# Usage:
+#   quick-agent install      Install Finder Quick Actions
+#   quick-agent uninstall    Remove Quick Actions and config
+#   quick-agent config       Change settings interactively
+#   quick-agent status       Show current configuration
+#   quick-agent --help       Show help
+#   quick-agent --version    Show version
+#
+
+set -eo pipefail
+
+VERSION="1.0.0"
+REPO="uburuntu/quick-agent"
+REPO_URL="https://github.com/${REPO}"
+CONFIG_DIR="$HOME/.config/quick-agent"
+CONFIG_FILE="$CONFIG_DIR/config"
+SERVICES_DIR="$HOME/Library/Services"
+
+# ── Formatting ───────────────────────────────────────────────────
+
+_bold()   { printf '\033[1m%s\033[0m' "$*"; }
+_dim()    { printf '\033[2m%s\033[0m' "$*"; }
+_green()  { printf '\033[32m%s\033[0m' "$*"; }
+_red()    { printf '\033[31m%s\033[0m' "$*"; }
+_cyan()   { printf '\033[36m%s\033[0m' "$*"; }
+_yellow() { printf '\033[33m%s\033[0m' "$*"; }
+
+_ok()   { printf "    $(_green '✓') %s\n" "$*"; }
+_fail() { printf "    $(_red '✗') %s\n" "$*"; }
+
+# ── Agent Registry ───────────────────────────────────────────────
+
+ALL_AGENTS="claude codex gemini aider cursor"
+
+agent_name() {
+    case "$1" in
+        claude) echo "Claude Code" ;;
+        codex)  echo "Codex" ;;
+        gemini) echo "Gemini" ;;
+        aider)  echo "Aider" ;;
+        cursor) echo "Cursor" ;;
+        *)      echo "$1" ;;
+    esac
+}
+
+agent_cmd() {
+    # The CLI command to run for each agent
+    echo "$1"
+}
+
+agent_type() {
+    case "$1" in
+        cursor) echo "gui" ;;
+        *)      echo "terminal" ;;
+    esac
+}
+
+agent_install_hint() {
+    case "$1" in
+        claude) echo "curl -fsSL https://claude.ai/install.sh | bash" ;;
+        codex)  echo "npm i -g @openai/codex" ;;
+        gemini) echo "npm i -g @anthropic-ai/gemini-cli" ;;
+        aider)  echo "pip install aider-chat" ;;
+        cursor) echo "Download from https://cursor.com" ;;
+    esac
+}
+
+agent_is_installed() {
+    _augment_path
+    case "$1" in
+        cursor)
+            [ -d "/Applications/Cursor.app" ] || command -v cursor &>/dev/null
+            ;;
+        *)
+            command -v "$1" &>/dev/null
+            ;;
+    esac
+}
+
+# ── Terminal Registry ────────────────────────────────────────────
+
+ALL_TERMINALS="terminal iterm2 ghostty warp"
+
+terminal_name() {
+    case "$1" in
+        terminal) echo "Terminal.app" ;;
+        iterm2)   echo "iTerm2" ;;
+        ghostty)  echo "Ghostty" ;;
+        warp)     echo "Warp" ;;
+        *)        echo "$1" ;;
+    esac
+}
+
+terminal_is_installed() {
+    case "$1" in
+        terminal) return 0 ;; # Always available
+        iterm2)   [ -d "/Applications/iTerm.app" ] ;;
+        ghostty)  [ -d "/Applications/Ghostty.app" ] ;;
+        warp)     [ -d "/Applications/Warp.app" ] ;;
+        *)        return 1 ;;
+    esac
+}
+
+# ── PATH ─────────────────────────────────────────────────────────
+
+_augment_path() {
+    local p
+    for p in \
+        "/usr/local/bin" \
+        "/opt/homebrew/bin" \
+        "/opt/homebrew/sbin" \
+        "$HOME/.local/bin" \
+        "$HOME/.cargo/bin" \
+    ; do
+        case ":$PATH:" in
+            *":$p:"*) ;;
+            *) [ -d "$p" ] && export PATH="$p:$PATH" ;;
+        esac
+    done
+    # nvm
+    if [ -d "$HOME/.nvm/versions/node" ]; then
+        local node_dir
+        node_dir=$(ls -d "$HOME/.nvm/versions/node/"*/bin 2>/dev/null | sort -V | tail -1)
+        [ -n "$node_dir" ] && export PATH="$node_dir:$PATH"
+    fi
+    # pyenv
+    [ -d "$HOME/.pyenv/shims" ] && export PATH="$HOME/.pyenv/shims:$PATH"
+    return 0
+}
+
+# ── Config ───────────────────────────────────────────────────────
+
+config_get() {
+    local key="$1" default="${2:-}"
+    if [ -f "$CONFIG_FILE" ]; then
+        local val
+        val=$(grep "^${key}=" "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+        echo "${val:-$default}"
+    else
+        echo "$default"
+    fi
+}
+
+config_set() {
+    local key="$1" value="$2"
+    mkdir -p "$CONFIG_DIR"
+    if [ -f "$CONFIG_FILE" ] && grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+        local tmp; tmp=$(mktemp)
+        sed "s|^${key}=.*|${key}=${value}|" "$CONFIG_FILE" > "$tmp"
+        mv "$tmp" "$CONFIG_FILE"
+    else
+        echo "${key}=${value}" >> "$CONFIG_FILE"
+    fi
+}
+
+# ── Detection ────────────────────────────────────────────────────
+
+auto_select_terminal() {
+    local id
+    for id in iterm2 ghostty warp terminal; do
+        terminal_is_installed "$id" && echo "$id" && return
+    done
+    echo "terminal"
+}
+
+auto_select_agent() {
+    local id
+    for id in $ALL_AGENTS; do
+        agent_is_installed "$id" && echo "$id" && return
+    done
+}
+
+# ── AppleScript Helpers ──────────────────────────────────────────
+
+_as_escape() {
+    # Escape a string for safe embedding in AppleScript double-quoted strings
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# ── Terminal Launch Functions ────────────────────────────────────
+
+_launch_terminal_app() {
+    local dir="$1" cmd="$2"
+    local edir; edir=$(_as_escape "$dir")
+    osascript <<EOF
+tell application "Terminal"
+    activate
+    do script "cd \"${edir}\" && ${cmd}"
+end tell
+EOF
+}
+
+_launch_iterm2() {
+    local dir="$1" cmd="$2"
+    local edir; edir=$(_as_escape "$dir")
+    osascript <<EOF
+tell application "iTerm2"
+    activate
+    set newWindow to (create window with default profile)
+    tell current session of newWindow
+        write text "cd \"${edir}\" && ${cmd}"
+    end tell
+end tell
+EOF
+}
+
+_launch_ghostty() {
+    local dir="$1" cmd="$2"
+    local edir; edir=$(_as_escape "$dir")
+    # Try native AppleScript (Ghostty v1.3.0+)
+    if osascript <<EOF 2>/dev/null
+tell application "Ghostty"
+    activate
+    set cfg to new surface configuration
+    set initial working directory of cfg to "${edir}"
+    set win to new window with configuration cfg
+    set term to focused terminal of selected tab of win
+    input text "${cmd}" & return to term
+end tell
+EOF
+    then
+        return 0
+    fi
+    # Fallback: open via CLI
+    open -na Ghostty --args --working-directory="${dir}"
+}
+
+_launch_warp() {
+    local dir="$1" cmd="$2"
+    # Warp doesn't support AppleScript or passing commands via URI.
+    # Use a temporary Launch Configuration YAML.
+    local cfg_name="quick-agent-$$"
+    local cfg_dir="$HOME/.warp/launch_configurations"
+    mkdir -p "$cfg_dir"
+    local yaml_dir; yaml_dir=$(printf '%s' "$dir" | sed 's/"/\\"/g')
+    cat > "${cfg_dir}/${cfg_name}.yaml" <<YAML
+---
+name: ${cfg_name}
+windows:
+  - tabs:
+    - title: Quick Agent
+      layout:
+        cwd: "${yaml_dir}"
+        commands:
+          - exec: ${cmd}
+YAML
+    open "warp://launch/${cfg_name}"
+    # Clean up temp config after delay
+    (sleep 10 && rm -f "${cfg_dir}/${cfg_name}.yaml") &>/dev/null &
+}
+
+_launch_in() {
+    local terminal_id="$1" dir="$2" cmd="$3"
+    case "$terminal_id" in
+        terminal) _launch_terminal_app "$dir" "$cmd" ;;
+        iterm2)   _launch_iterm2 "$dir" "$cmd" ;;
+        ghostty)  _launch_ghostty "$dir" "$cmd" ;;
+        warp)     _launch_warp "$dir" "$cmd" ;;
+        *)        _launch_terminal_app "$dir" "$cmd" ;;
+    esac
+}
+
+# ── Workflow Generation ──────────────────────────────────────────
+
+_generate_info_plist() {
+    local menu_name="$1"
+    local icon_name="${2:-terminal}"
+    cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSIconName</key>
+			<string>${icon_name}</string>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>${menu_name}</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>runWorkflowAsService</string>
+			<key>NSRequiredContext</key>
+			<dict>
+				<key>NSApplicationIdentifier</key>
+				<string>com.apple.finder</string>
+			</dict>
+			<key>NSSendFileTypes</key>
+			<array>
+				<string>public.item</string>
+				<string>public.folder</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
+PLIST
+}
+
+_generate_document_wflow() {
+    local command_string="$1"
+    # XML-escape: only & and < need escaping inside <string> elements
+    local escaped_cmd
+    escaped_cmd=$(printf '%s' "$command_string" | sed 's/&/\&amp;/g; s/</\&lt;/g')
+    local uuid1 uuid2 uuid3
+    uuid1=$(uuidgen)
+    uuid2=$(uuidgen)
+    uuid3=$(uuidgen)
+
+    cat <<WFLOW
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMApplicationBuild</key>
+	<string>523</string>
+	<key>AMApplicationVersion</key>
+	<string>2.10</string>
+	<key>AMDocumentVersion</key>
+	<string>2</string>
+	<key>actions</key>
+	<array>
+		<dict>
+			<key>action</key>
+			<dict>
+				<key>AMAccepts</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Optional</key>
+					<true/>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.path</string>
+					</array>
+				</dict>
+				<key>AMActionVersion</key>
+				<string>1.0.2</string>
+				<key>AMApplication</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>AMParameterProperties</key>
+				<dict>
+					<key>COMMAND_STRING</key>
+					<dict/>
+					<key>CheckedForUserDefaultShell</key>
+					<dict/>
+					<key>inputMethod</key>
+					<dict/>
+					<key>shell</key>
+					<dict/>
+					<key>source</key>
+					<dict/>
+				</dict>
+				<key>AMProvides</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.path</string>
+					</array>
+				</dict>
+				<key>ActionBundlePath</key>
+				<string>/System/Library/Automator/Run Shell Script.action</string>
+				<key>ActionName</key>
+				<string>Run Shell Script</string>
+				<key>ActionParameters</key>
+				<dict>
+					<key>COMMAND_STRING</key>
+					<string>${escaped_cmd}</string>
+					<key>CheckedForUserDefaultShell</key>
+					<true/>
+					<key>inputMethod</key>
+					<integer>1</integer>
+					<key>shell</key>
+					<string>/bin/bash</string>
+					<key>source</key>
+					<string></string>
+				</dict>
+				<key>BundleIdentifier</key>
+				<string>com.apple.RunShellScript</string>
+				<key>CFBundleVersion</key>
+				<string>1.0.2</string>
+				<key>CanShowSelectedItemsWhenRun</key>
+				<false/>
+				<key>CanShowWhenRun</key>
+				<true/>
+				<key>Category</key>
+				<array>
+					<string>AMCategoryUtilities</string>
+				</array>
+				<key>Class Name</key>
+				<string>RunShellScriptAction</string>
+				<key>InputUUID</key>
+				<string>${uuid1}</string>
+				<key>Keywords</key>
+				<array>
+					<string>Shell</string>
+					<string>Script</string>
+					<string>Command</string>
+					<string>Run</string>
+					<string>Unix</string>
+				</array>
+				<key>OutputUUID</key>
+				<string>${uuid2}</string>
+				<key>UUID</key>
+				<string>${uuid3}</string>
+				<key>UnlocalizedApplications</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>arguments</key>
+				<dict>
+					<key>0</key>
+					<dict>
+						<key>default value</key>
+						<string>/bin/bash</string>
+						<key>name</key>
+						<string>shell</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>0</string>
+					</dict>
+					<key>1</key>
+					<dict>
+						<key>default value</key>
+						<string></string>
+						<key>name</key>
+						<string>source</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>1</string>
+					</dict>
+					<key>2</key>
+					<dict>
+						<key>default value</key>
+						<integer>1</integer>
+						<key>name</key>
+						<string>inputMethod</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>2</string>
+					</dict>
+					<key>3</key>
+					<dict>
+						<key>default value</key>
+						<string></string>
+						<key>name</key>
+						<string>COMMAND_STRING</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>3</string>
+					</dict>
+					<key>4</key>
+					<dict>
+						<key>default value</key>
+						<true/>
+						<key>name</key>
+						<string>CheckedForUserDefaultShell</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>4</string>
+					</dict>
+				</dict>
+				<key>isViewVisible</key>
+				<true/>
+				<key>location</key>
+				<string>529.000000:620.000000</string>
+				<key>nibPath</key>
+				<string>/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib</string>
+			</dict>
+		</dict>
+	</array>
+	<key>connectors</key>
+	<dict/>
+	<key>workflowMetaData</key>
+	<dict>
+		<key>inputTypeIdentifier</key>
+		<string>com.apple.Automator.fileSystemObject</string>
+		<key>outputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>presentationMode</key>
+		<integer>11</integer>
+		<key>processesInput</key>
+		<integer>1</integer>
+		<key>serviceApplicationBundleID</key>
+		<string>com.apple.finder</string>
+		<key>serviceApplicationPath</key>
+		<string>/System/Library/CoreServices/Finder.app</string>
+		<key>serviceInputTypeIdentifier</key>
+		<string>com.apple.Automator.fileSystemObject</string>
+		<key>serviceOutputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>serviceProcessesInput</key>
+		<integer>1</integer>
+		<key>systemImageName</key>
+		<string>terminal</string>
+		<key>useAutomaticInputType</key>
+		<integer>0</integer>
+		<key>workflowTypeIdentifier</key>
+		<string>com.apple.Automator.servicesMenu</string>
+	</dict>
+</dict>
+</plist>
+WFLOW
+}
+
+_create_workflow() {
+    local name="$1" command_string="$2" icon="${3:-terminal}"
+    local wf_dir="${SERVICES_DIR}/${name}.workflow/Contents"
+    mkdir -p "$wf_dir"
+    _generate_info_plist "$name" "$icon" > "$wf_dir/Info.plist"
+    _generate_document_wflow "$command_string" > "$wf_dir/document.wflow"
+}
+
+# ── The shell script embedded in each workflow ───────────────────
+# Automator runs with a minimal PATH, so we prepend common locations
+# then delegate to the quick-agent binary.
+
+_wf_script() {
+    local mode="$1"
+    # This heredoc is single-quoted to prevent expansion of $HOME, $PATH, $1
+    # These variables are expanded at RUNTIME by Automator's bash
+    cat <<'__HEADER__'
+export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+if [ -d "$HOME/.nvm/versions/node" ]; then
+  nd=$(ls -d "$HOME/.nvm/versions/node/"*/bin 2>/dev/null | sort -V | tail -1)
+  [ -n "$nd" ] && export PATH="$nd:$PATH"
+fi
+[ -d "$HOME/.pyenv/shims" ] && export PATH="$HOME/.pyenv/shims:$PATH"
+__HEADER__
+    printf 'exec quick-agent _run %s "$1"\n' "$mode"
+}
+
+# ── Workflow Install / Remove ────────────────────────────────────
+
+_install_workflows() {
+    local default_agent; default_agent=$(config_get "default_agent" "claude")
+    local display_name; display_name=$(agent_name "$default_agent")
+
+    # 1. Default agent — one click to launch
+    _create_workflow "Open in ${display_name}" "$(_wf_script default)" "terminal"
+    _ok "Open in ${display_name}"
+
+    # 2. Agent chooser — pick from all installed agents
+    _create_workflow "Open in Agent..." "$(_wf_script choose)" "ellipsis.circle"
+    _ok "Open in Agent..."
+
+    # 3. Settings
+    _create_workflow "Quick Agent Settings" "$(_wf_script setup)" "gear"
+    _ok "Quick Agent Settings"
+
+    # Refresh the services database
+    /System/Library/CoreServices/pbs -flush 2>/dev/null || true
+}
+
+_remove_workflows() {
+    local wf
+    for wf in "$SERVICES_DIR"/Open\ in\ *.workflow "$SERVICES_DIR"/Quick\ Agent\ Settings.workflow; do
+        if [ -d "$wf" ]; then
+            rm -rf "$wf"
+            _ok "Removed: $(basename "$wf" .workflow)"
+        fi
+    done
+    /System/Library/CoreServices/pbs -flush 2>/dev/null || true
+    return 0
+}
+
+# ── cmd: install ─────────────────────────────────────────────────
+
+cmd_install() {
+    _augment_path
+    echo ""
+    printf "  $(_bold '⚡ Quick Agent') v${VERSION}\n"
+    echo ""
+
+    # ── Scan agents ──
+    printf "  Scanning for AI coding agents...\n"
+    local installed_agents=""
+    local id
+    for id in $ALL_AGENTS; do
+        if agent_is_installed "$id"; then
+            _ok "$(printf '%-8s' "$id") — $(agent_name "$id")"
+            installed_agents="${installed_agents} ${id}"
+        else
+            _fail "$(printf '%-8s' "$id") — $(_dim 'not found')"
+        fi
+    done
+    installed_agents="${installed_agents# }"  # trim leading space
+
+    if [ -z "$installed_agents" ]; then
+        echo ""
+        printf "  $(_red 'No AI agents found.') Install at least one:\n"
+        for id in $ALL_AGENTS; do
+            printf "    • %s:  %s\n" "$(agent_name "$id")" "$(agent_install_hint "$id")"
+        done
+        echo ""
+        exit 1
+    fi
+    echo ""
+
+    # ── Scan terminals ──
+    printf "  Scanning for terminal apps...\n"
+    for id in $ALL_TERMINALS; do
+        if terminal_is_installed "$id"; then
+            _ok "$(terminal_name "$id")"
+        else
+            _fail "$(terminal_name "$id") — $(_dim 'not found')"
+        fi
+    done
+    echo ""
+
+    # ── Auto-select defaults ──
+    local default_agent; default_agent=$(auto_select_agent)
+    local default_terminal; default_terminal=$(auto_select_terminal)
+
+    local show_summary=true
+    while $show_summary; do
+        printf "  ─────────────────────────────────\n"
+        printf "  Default agent:  $(_bold "$(agent_name "$default_agent")")\n"
+        printf "  Terminal:       $(_bold "$(terminal_name "$default_terminal")")\n"
+        printf "  ─────────────────────────────────\n"
+        echo ""
+
+        printf "  Install with these settings? [$(_bold 'Y')/n/c] "
+        read -r choice
+        case "${choice:-y}" in
+            [Yy]|[Yy]es|"")
+                show_summary=false
+                ;;
+            [Nn]|[Nn]o)
+                echo ""; printf "  Cancelled.\n"; echo ""
+                exit 0
+                ;;
+            [Cc]|[Cc]onfigure)
+                # Pick default agent
+                echo ""
+                printf "  Choose default agent:\n"
+                local i=1 agents_arr=()
+                for id in $installed_agents; do
+                    agents_arr+=("$id")
+                    local marker=""; [ "$id" = "$default_agent" ] && marker=" $(_dim '← current')"
+                    printf "    [%d] %s%s\n" "$i" "$(agent_name "$id")" "$marker"
+                    i=$((i + 1))
+                done
+                printf "  Choice: "
+                read -r achoice
+                if [ -n "$achoice" ] && [ "$achoice" -ge 1 ] 2>/dev/null && [ "$achoice" -le "${#agents_arr[@]}" ] 2>/dev/null; then
+                    default_agent="${agents_arr[$((achoice - 1))]}"
+                fi
+
+                # Pick terminal
+                echo ""
+                printf "  Choose terminal:\n"
+                i=1
+                local terms_arr=()
+                for id in $ALL_TERMINALS; do
+                    if terminal_is_installed "$id"; then
+                        terms_arr+=("$id")
+                        local marker=""; [ "$id" = "$default_terminal" ] && marker=" $(_dim '← current')"
+                        printf "    [%d] %s%s\n" "$i" "$(terminal_name "$id")" "$marker"
+                        i=$((i + 1))
+                    fi
+                done
+                printf "  Choice: "
+                read -r tchoice
+                if [ -n "$tchoice" ] && [ "$tchoice" -ge 1 ] 2>/dev/null && [ "$tchoice" -le "${#terms_arr[@]}" ] 2>/dev/null; then
+                    default_terminal="${terms_arr[$((tchoice - 1))]}"
+                fi
+                echo ""
+                ;;
+        esac
+    done
+    echo ""
+
+    # Save config
+    config_set "default_agent" "$default_agent"
+    config_set "terminal" "$default_terminal"
+
+    # Remove old workflows (silently)
+    _remove_workflows 2>/dev/null || true
+
+    # Install
+    printf "  Installing Quick Actions...\n"
+    _install_workflows
+
+    echo ""
+    printf "  ✨ $(_bold 'Done!') Right-click any folder in Finder to try it.\n"
+    echo ""
+    printf "  $(_dim 'Tip: If Quick Actions don'\''t appear, go to System Settings →')\n"
+    printf "  $(_dim '     Privacy & Security → Extensions → Finder Extensions')\n"
+    echo ""
+}
+
+# ── cmd: uninstall ───────────────────────────────────────────────
+
+cmd_uninstall() {
+    echo ""
+    printf "  $(_bold '⚡ Quick Agent') — Uninstall\n"
+    echo ""
+
+    printf "  Removing Quick Actions...\n"
+    _remove_workflows 2>/dev/null || printf "    $(_dim 'No workflows found.')\n"
+
+    if [ -d "$CONFIG_DIR" ]; then
+        rm -rf "$CONFIG_DIR"
+        _ok "Removed configuration"
+    fi
+
+    echo ""
+    printf "  ✨ $(_bold 'Done!') All Quick Actions have been removed.\n"
+    echo ""
+    local bin_path; bin_path=$(command -v quick-agent 2>/dev/null || echo "/usr/local/bin/quick-agent")
+    printf "  $(_dim "To also remove the CLI:  rm ${bin_path}")\n"
+    echo ""
+}
+
+# ── cmd: config ──────────────────────────────────────────────────
+
+cmd_config() {
+    _augment_path
+    echo ""
+    printf "  $(_bold '⚡ Quick Agent') — Settings\n"
+    echo ""
+
+    local current_agent; current_agent=$(config_get "default_agent" "claude")
+    local current_terminal; current_terminal=$(config_get "terminal" "terminal")
+
+    printf "  Default agent:  $(_bold "$(agent_name "$current_agent")")\n"
+    printf "  Terminal:       $(_bold "$(terminal_name "$current_terminal")")\n"
+    echo ""
+    printf "  [1] Change default agent\n"
+    printf "  [2] Change terminal\n"
+    printf "  [3] Reinstall Quick Actions\n"
+    printf "  [q] Quit\n"
+    echo ""
+    printf "  Choice: "
+    read -r choice
+
+    local needs_reinstall=false
+
+    case "$choice" in
+        1)
+            echo ""
+            printf "  Available agents:\n"
+            local i=1 agents_arr=()
+            for id in $ALL_AGENTS; do
+                agents_arr+=("$id")
+                local status marker=""
+                agent_is_installed "$id" && status="$(_green '✓')" || status="$(_red '✗')"
+                [ "$id" = "$current_agent" ] && marker=" $(_dim '← current')"
+                printf "    %s [%d] %s%s\n" "$status" "$i" "$(agent_name "$id")" "$marker"
+                i=$((i + 1))
+            done
+            printf "  Choice: "
+            read -r achoice
+            if [ -n "$achoice" ] && [ "$achoice" -ge 1 ] 2>/dev/null && [ "$achoice" -le "${#agents_arr[@]}" ] 2>/dev/null; then
+                local new_agent="${agents_arr[$((achoice - 1))]}"
+                if [ "$new_agent" != "$current_agent" ]; then
+                    config_set "default_agent" "$new_agent"
+                    _ok "Default agent → $(agent_name "$new_agent")"
+                    needs_reinstall=true
+                fi
+            fi
+            ;;
+        2)
+            echo ""
+            printf "  Available terminals:\n"
+            local i=1 terms_arr=()
+            for id in $ALL_TERMINALS; do
+                terms_arr+=("$id")
+                local status marker=""
+                terminal_is_installed "$id" && status="$(_green '✓')" || status="$(_red '✗')"
+                [ "$id" = "$current_terminal" ] && marker=" $(_dim '← current')"
+                printf "    %s [%d] %s%s\n" "$status" "$i" "$(terminal_name "$id")" "$marker"
+                i=$((i + 1))
+            done
+            printf "  Choice: "
+            read -r tchoice
+            if [ -n "$tchoice" ] && [ "$tchoice" -ge 1 ] 2>/dev/null && [ "$tchoice" -le "${#terms_arr[@]}" ] 2>/dev/null; then
+                local new_terminal="${terms_arr[$((tchoice - 1))]}"
+                if [ "$new_terminal" != "$current_terminal" ]; then
+                    config_set "terminal" "$new_terminal"
+                    _ok "Terminal → $(terminal_name "$new_terminal")"
+                fi
+            fi
+            ;;
+        3)  needs_reinstall=true ;;
+        [Qq]|"") echo ""; return ;;
+    esac
+
+    if $needs_reinstall; then
+        echo ""
+        printf "  Reinstalling Quick Actions...\n"
+        _remove_workflows 2>/dev/null || true
+        _install_workflows
+        echo ""
+        printf "  ✨ $(_bold 'Done!')\n"
+    fi
+    echo ""
+}
+
+# ── cmd: status ──────────────────────────────────────────────────
+
+cmd_status() {
+    _augment_path
+    echo ""
+    printf "  $(_bold '⚡ Quick Agent') v${VERSION}\n"
+    echo ""
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        printf "  $(_yellow 'Not configured.') Run: quick-agent install\n"
+        echo ""
+        return
+    fi
+
+    local current_agent; current_agent=$(config_get "default_agent" "claude")
+    local current_terminal; current_terminal=$(config_get "terminal" "terminal")
+
+    printf "  Default agent:  $(_bold "$(agent_name "$current_agent")")"
+    agent_is_installed "$current_agent" && printf " $(_green '✓')" || printf " $(_red '✗ not in PATH')"
+    echo ""
+    printf "  Terminal:       $(_bold "$(terminal_name "$current_terminal")")"
+    terminal_is_installed "$current_terminal" && printf " $(_green '✓')" || printf " $(_red '✗ not found')"
+    echo ""
+    echo ""
+
+    printf "  Installed Quick Actions:\n"
+    local found=false
+    for wf in "$SERVICES_DIR"/Open\ in\ *.workflow "$SERVICES_DIR"/Quick\ Agent*.workflow; do
+        if [ -d "$wf" ]; then
+            _ok "$(basename "$wf" .workflow)"
+            found=true
+        fi
+    done
+    if ! $found; then printf "    $(_dim 'None found. Run: quick-agent install')\n"; fi
+    echo ""
+}
+
+# ── cmd: _run (internal — called by Quick Action workflows) ──────
+
+cmd_run() {
+    local mode="${1:-default}"
+    shift 2>/dev/null || true
+
+    _augment_path
+
+    case "$mode" in
+        default) _run_default_agent "$@" ;;
+        choose)  _run_choose_agent "$@" ;;
+        setup)   _run_setup ;;
+        *)       _run_agent "$mode" "$@" ;;
+    esac
+}
+
+_resolve_dir() {
+    local path="$1"
+    if [ -d "$path" ]; then
+        echo "$path"
+    elif [ -f "$path" ]; then
+        dirname "$path"
+    else
+        echo "$HOME"
+    fi
+}
+
+_ensure_config() {
+    [ -f "$CONFIG_FILE" ] && return 0
+    # First-run: show a native macOS dialog to pick terminal
+    local tlist="" tids=()
+    local id
+    for id in $ALL_TERMINALS; do
+        if terminal_is_installed "$id"; then
+            tids+=("$id")
+            [ -n "$tlist" ] && tlist="${tlist}, "
+            tlist="${tlist}\"$(terminal_name "$id")\""
+        fi
+    done
+
+    local chosen
+    chosen=$(osascript -e "choose from list {${tlist}} with title \"Quick Agent — Setup\" with prompt \"Choose your preferred terminal:\" default items {\"$(terminal_name "${tids[0]}")\"}" 2>/dev/null) || true
+
+    local selected_terminal="terminal"
+    if [ "$chosen" != "false" ] && [ -n "$chosen" ]; then
+        for id in "${tids[@]}"; do
+            [ "$(terminal_name "$id")" = "$chosen" ] && selected_terminal="$id" && break
+        done
+    fi
+    config_set "terminal" "$selected_terminal"
+    local default; default=$(auto_select_agent)
+    config_set "default_agent" "${default:-claude}"
+}
+
+_run_default_agent() {
+    local target="${1:-$HOME}"
+    _ensure_config
+    local agent_id; agent_id=$(config_get "default_agent" "claude")
+    _run_agent "$agent_id" "$target"
+}
+
+_run_agent() {
+    local agent_id="$1" target="${2:-$HOME}"
+    _ensure_config
+    local dir; dir=$(_resolve_dir "$target")
+    local atype; atype=$(agent_type "$agent_id")
+    local acmd; acmd=$(agent_cmd "$agent_id")
+
+    # Check if agent is installed
+    if ! agent_is_installed "$agent_id"; then
+        local hint; hint=$(agent_install_hint "$agent_id")
+        osascript -e "display dialog \"$(agent_name "$agent_id") is not installed.
+
+Install with:
+${hint}\" with title \"Quick Agent\" buttons {\"OK\"} default button \"OK\" with icon stop" 2>/dev/null || true
+        exit 1
+    fi
+
+    if [ "$atype" = "gui" ]; then
+        open -a "$(agent_name "$agent_id")" "$dir"
+    else
+        local tid; tid=$(config_get "terminal" "terminal")
+        _launch_in "$tid" "$dir" "$acmd"
+    fi
+}
+
+_run_choose_agent() {
+    local target="${1:-$HOME}"
+    _ensure_config
+    local default_agent; default_agent=$(config_get "default_agent" "claude")
+
+    # Build list of available agents (excluding default, which has its own action)
+    local alist="" aids=()
+    local id
+    for id in $ALL_AGENTS; do
+        if agent_is_installed "$id" && [ "$id" != "$default_agent" ]; then
+            aids+=("$id")
+            [ -n "$alist" ] && alist="${alist}, "
+            alist="${alist}\"$(agent_name "$id")\""
+        fi
+    done
+
+    if [ -z "$alist" ]; then
+        osascript -e 'display dialog "No additional AI agents found.
+
+Install more agents and try again." with title "Quick Agent" buttons {"OK"} default button "OK" with icon note' 2>/dev/null || true
+        exit 0
+    fi
+
+    local chosen
+    chosen=$(osascript -e "choose from list {${alist}} with title \"Quick Agent\" with prompt \"Choose an AI agent:\"" 2>/dev/null) || true
+
+    [ "$chosen" = "false" ] || [ -z "$chosen" ] && exit 0
+
+    # Map display name → agent id
+    local chosen_id=""
+    for id in "${aids[@]}"; do
+        [ "$(agent_name "$id")" = "$chosen" ] && chosen_id="$id" && break
+    done
+
+    [ -n "$chosen_id" ] && _run_agent "$chosen_id" "$target"
+}
+
+_run_setup() {
+    _ensure_config
+    local tid; tid=$(config_get "terminal" "terminal")
+    _launch_in "$tid" "$HOME" "quick-agent config"
+}
+
+# ── cmd: help ────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<HELP
+
+  $(_bold '⚡ Quick Agent') v${VERSION}
+  Right-click any folder in Finder to open AI coding agents.
+
+  $(_bold 'Usage:')
+    quick-agent install       Install Finder Quick Actions
+    quick-agent uninstall     Remove Quick Actions and config
+    quick-agent config        Change settings (default agent, terminal)
+    quick-agent status        Show current configuration
+
+  $(_bold 'Options:')
+    --help, -h                Show this help
+    --version, -v             Show version
+
+  $(_bold 'Supported agents:')      Claude Code, Codex, Gemini, Aider, Cursor
+  $(_bold 'Supported terminals:')   Terminal.app, iTerm2, Ghostty, Warp
+
+  $(_bold 'More info:')             ${REPO_URL}
+
+HELP
+}
+
+# ── main ─────────────────────────────────────────────────────────
+
+main() {
+    if [ "$(uname)" != "Darwin" ]; then
+        printf "  $(_red 'Error:') quick-agent only works on macOS.\n" >&2
+        exit 1
+    fi
+
+    case "${1:-}" in
+        install)        cmd_install ;;
+        uninstall)      cmd_uninstall ;;
+        config)         cmd_config ;;
+        status)         cmd_status ;;
+        _run)           shift; cmd_run "$@" ;;
+        --help|-h|help) cmd_help ;;
+        --version|-v)   echo "quick-agent v${VERSION}" ;;
+        "")             cmd_help ;;
+        *)
+            printf "  $(_red 'Unknown command:') %s\n" "$1" >&2
+            printf "  Run '$(_bold 'quick-agent --help')' for usage.\n" >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
